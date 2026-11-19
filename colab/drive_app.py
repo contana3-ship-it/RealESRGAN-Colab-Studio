@@ -1,28 +1,32 @@
-"""Google Drive source selector for RealESRGAN x4 on Google Colab.
+"""Colab notebook UI: Google Drive video -> durable x4 restoration -> Google Drive.
 
-No browser uploads, local web servers or Cloudflare tunnels.
+Use ordinary Colab mount authorization. No tunnel and no browser upload.
 """
 from __future__ import annotations
 
+import html
+import json
 import os
-import shutil
 import traceback
 from pathlib import Path
 
+from colab.checkpoint_engine import restore_video
+
 VIDEO_TYPES = {'.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v'}
 DRIVE_ROOT = Path('/content/drive/MyDrive')
-OUTPUT_DEFAULT = DRIVE_ROOT / 'RealESRGAN-Studio' / 'outputs'
+STUDIO_ROOT = DRIVE_ROOT / 'RealESRGAN-Studio'
+OUTPUT_DEFAULT = STUDIO_ROOT / 'outputs'
+CHECKPOINT_DEFAULT = STUDIO_ROOT / 'checkpoints'
 
 
 def list_videos(folder: Path, max_files: int = 2000):
-    """Enumerate video files under a chosen Drive folder without following symlinks."""
     if not folder.is_dir():
         return []
     result = []
-    for root, dirs, files in os.walk(folder, followlinks=False):
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
+    for base, dirs, files in os.walk(folder, followlinks=False):
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d != 'checkpoints']
         for filename in files:
-            path = Path(root) / filename
+            path = Path(base) / filename
             if path.suffix.lower() in VIDEO_TYPES and path.is_file():
                 result.append(path)
                 if len(result) >= max_files:
@@ -30,123 +34,177 @@ def list_videos(folder: Path, max_files: int = 2000):
     return sorted(result, key=lambda p: str(p).lower())
 
 
-def safe_drive_file(raw: str) -> Path:
-    """Accept only existing videos within the mounted Drive MyDrive folder."""
+def inside_drive(raw: str) -> Path:
     p = Path(raw.strip()).expanduser()
     if not p.is_absolute():
+        # Accept either "Movies/video.mp4" or "MyDrive/Movies/video.mp4".
+        if p.parts and p.parts[0].lower() == 'mydrive':
+            p = Path(*p.parts[1:])
         p = DRIVE_ROOT / p
-    p = p.resolve(strict=True)
-    p.relative_to(DRIVE_ROOT.resolve(strict=True))
+    p = p.resolve()
+    p.relative_to(DRIVE_ROOT.resolve())
+    return p
+
+
+def safe_drive_file(raw: str) -> Path:
+    p = inside_drive(raw)
     if not p.is_file() or p.suffix.lower() not in VIDEO_TYPES:
         raise ValueError('Hãy chọn một file video hợp lệ trên Google Drive.')
     return p
 
 
-def restore_from_drive(src: Path, output_folder: Path, tile: int = 128):
-    from colab.native_app import run_restore
-    if not output_folder.is_dir():
-        output_folder.mkdir(parents=True, exist_ok=True)
-    output_folder = output_folder.resolve()
-    output_folder.relative_to(DRIVE_ROOT.resolve())
-    print('Video đầu vào:', src, flush=True)
-    print('Video đầu ra:', output_folder, flush=True)
-    print('Đang khôi phục trực tiếp từ video Google Drive. Frame tạm trên ổ đĩa Colab.', flush=True)
-    restored_local = run_restore(src, tile=tile)
-    # Copy to a .partial file before atomic promotion so incomplete output is never
-    # presented as a completed MP4 after an interrupted Drive transfer.
-    final = output_folder / restored_local.name
-    temporary = output_folder / (restored_local.name + '.partial')
-    print('Đang lưu MP4 hoàn chỉnh vào Google Drive...', flush=True)
-    try:
-        with restored_local.open('rb') as source, temporary.open('wb') as target:
-            shutil.copyfileobj(source, target, length=8 * 1024 * 1024)
-        if temporary.stat().st_size != restored_local.stat().st_size:
-            raise IOError('Dung lượng ghi lên Drive không khớp với file kết quả.')
-        temporary.replace(final)
-    except Exception:
-        temporary.unlink(missing_ok=True)
-        raise
-    print('HOÀN THÀNH:', final, flush=True)
-    return final
+def checkpoint_summary(folder: Path):
+    if not folder.is_dir():
+        return []
+    items = []
+    for p in folder.glob('*/checkpoint.json'):
+        try:
+            x = json.loads(p.read_text(encoding='utf-8'))
+            items.append(x)
+        except (OSError, json.JSONDecodeError):
+            pass
+    items.sort(key=lambda x: x.get('updated_at', ''), reverse=True)
+    return items
+
+
+def restore_from_drive(src: Path, output_folder: Path, tile: int = 0,
+                       *, segment_frames: int = 60, crf: int = 14,
+                       precision: str = 'fp16', stage_source: bool = True,
+                       preset: str = 'veryfast'):
+    """Public API; source/output/checkpoints stay on mounted Drive."""
+    src = safe_drive_file(str(src))
+    output_folder = inside_drive(str(output_folder))
+    checkpoint_root = inside_drive(os.getenv('DRIVE_CHECKPOINT_DIR', str(CHECKPOINT_DEFAULT)))
+    output_folder.mkdir(parents=True, exist_ok=True)
+    checkpoint_root.mkdir(parents=True, exist_ok=True)
+    print('Nguồn:', src, flush=True)
+    print('Checkpoint bền vững:', checkpoint_root, flush=True)
+    print('MP4 đích:', output_folder, flush=True)
+    return restore_video(src, output_folder, checkpoint_root,
+                         tile=tile, segment_frames=segment_frames, crf=crf,
+                         precision=precision, preset=preset, stage_source=stage_source)
 
 
 def main():
     import torch
     if not torch.cuda.is_available():
-        raise RuntimeError('Chưa bật GPU. Chọn Runtime → Change runtime type → T4 GPU.')
+        raise RuntimeError('Chưa có CUDA GPU. Trong Colab chọn Runtime → Change runtime type → T4 GPU.')
     from google.colab import drive
-    from IPython.display import display, HTML, clear_output
+    from IPython.display import display, HTML, clear_output, FileLink
     import ipywidgets as widgets
 
-    print('Đang kết nối Google Drive...', flush=True)
+    print('Mount Google Drive...', flush=True)
     drive.mount('/content/drive', force_remount=False)
     if not DRIVE_ROOT.is_dir():
-        raise RuntimeError('Không tìm thấy MyDrive. Hãy kiểm tra quyền truy cập Google Drive.')
+        raise RuntimeError('Không tìm thấy Google Drive MyDrive.')
 
-    watch_folder = Path(os.getenv('DRIVE_VIDEO_DIR', str(DRIVE_ROOT)))
-    output_folder = Path(os.getenv('DRIVE_OUTPUT_DIR', str(OUTPUT_DEFAULT)))
+    watch_folder = inside_drive(os.getenv('DRIVE_VIDEO_DIR', str(DRIVE_ROOT)))
+    output_folder = inside_drive(os.getenv('DRIVE_OUTPUT_DIR', str(OUTPUT_DEFAULT)))
+    checkpoints = inside_drive(os.getenv('DRIVE_CHECKPOINT_DIR', str(CHECKPOINT_DEFAULT)))
     videos = list_videos(watch_folder)
+    gpu_name = html.escape(torch.cuda.get_device_name(0))
 
-    display(HTML('''<div style="padding:14px 18px;border-radius:12px;background:#16253b;color:white;font:15px system-ui">
-      <b style="font-size:20px">RealESRGAN x4 — Google Drive</b>
-      <p>Không upload. Chọn video đã lưu trong Drive, ứng dụng sẽ tự bắt đầu khôi phục khi nhấn <b>Khôi phục</b>.</p>
-      <small>Video đầu vào từ MyDrive · Frame tạm tại Colab · MP4 kết quả lưu về MyDrive.</small></div>'''))
-    folder_text = widgets.Text(value=str(watch_folder), description='Thư mục:', layout=widgets.Layout(width='95%'), style={'description_width':'85px'})
-    options = [(str(p.relative_to(DRIVE_ROOT)) + f' ({p.stat().st_size/1048576:.1f} MB)', str(p)) for p in videos]
-    selector = widgets.Dropdown(options=options or [('Không tìm thấy video, hãy nhập đường dẫn bên dưới', '')], description='Video:', layout=widgets.Layout(width='95%'), style={'description_width':'85px'})
-    manual = widgets.Text(value='', placeholder='/content/drive/MyDrive/Video/input.mp4 (tùy chọn)', description='Đường dẫn:', layout=widgets.Layout(width='95%'), style={'description_width':'85px'})
-    output_text = widgets.Text(value=str(output_folder), description='Xuất MP4:', layout=widgets.Layout(width='95%'), style={'description_width':'85px'})
-    tile = widgets.Dropdown(options=[64,128,256], value=128, description='GPU Tile:', style={'description_width':'85px'})
-    reload_btn = widgets.Button(description='Quét lại Drive', icon='refresh', button_style='info')
-    start_btn = widgets.Button(description='Khôi phục video x4', icon='play', button_style='success')
-    status = widgets.HTML(value=f'<small>Đã tìm thấy {len(videos)} video (tối đa 2.000 file). Chọn video và nhấn Khôi phục.</small>')
-    logs = widgets.Output(layout=widgets.Layout(border='1px solid #ddd', padding='8px'))
+    display(HTML(f'''<div style="padding:16px 20px;border-radius:12px;background:#14243a;color:#f4f7ff;font:15px system-ui">
+      <b style="font-size:21px">RealESRGAN x4plus — Drive Resume Edition</b>
+      <p>GPU: {gpu_name} · Không upload · Không Tunnel · Chọn video từ Drive</p>
+      <small>Checkpoint MP4 theo từng đoạn: nếu Colab ngắt, mở lại notebook và chọn cùng video/cấu hình để tiếp tục.</small>
+    </div>'''))
+
+    layout = widgets.Layout(width='97%')
+    sty = {'description_width': '105px'}
+    folder_text = widgets.Text(value=str(watch_folder), description='Quét Drive:', layout=layout, style=sty)
+    selector = widgets.Dropdown(options=[], description='Video:', layout=layout, style=sty)
+    manual = widgets.Text(value='', description='Đường dẫn:', placeholder='Tùy chọn: MyDrive/Movies/example.mp4', layout=layout, style=sty)
+    output_text = widgets.Text(value=str(output_folder), description='Xuất MP4:', layout=layout, style=sty)
+    checkpoint_text = widgets.Text(value=str(checkpoints), description='Checkpoint:', layout=layout, style=sty, disabled=True)
+    tile = widgets.Dropdown(options=[('Tự động theo GPU (khuyên dùng)', 0), ('64', 64), ('128', 128),
+                                     ('192', 192), ('256', 256), ('384', 384)], value=0,
+                            description='Tile GPU:', style=sty)
+    quality = widgets.Dropdown(options=[('Chất lượng rất cao • CRF 12', 12),
+                                        ('Khuyên dùng • CRF 14', 14),
+                                        ('Cân bằng dung lượng • CRF 16', 16),
+                                        ('Dung lượng thấp hơn • CRF 18', 18)], value=14,
+                               description='MP4:', style=sty)
+    precision = widgets.Dropdown(options=[('FP16 • nhanh (khuyên dùng)', 'fp16'),
+                                          ('FP32 • chậm hơn', 'fp32')], value='fp16',
+                                 description='Độ chính xác:', style=sty)
+    chunk = widgets.Dropdown(options=[('30 frame • lưu rất thường xuyên', 30),
+                                      ('60 frame • khuyên dùng', 60),
+                                      ('120 frame • ít ghi Drive hơn', 120),
+                                      ('240 frame • hiệu quả cho runtime ổn định', 240)], value=60,
+                             description='Checkpoint:', style=sty)
+    stage = widgets.Checkbox(value=True, description='Sao chép video về ổ đĩa Colab trước khi xử lý (tăng tốc đọc)')
+    scan_btn = widgets.Button(description='Quét lại video', icon='refresh', button_style='info')
+    start_btn = widgets.Button(description='Bắt đầu / Tiếp tục từ checkpoint', icon='play', button_style='success',
+                               layout=widgets.Layout(width='310px'))
+    jobs_btn = widgets.Button(description='Xem checkpoint đã lưu', icon='history')
+    status = widgets.HTML(value='')
+    logs = widgets.Output(layout=widgets.Layout(border='1px solid #ddd', padding='10px', max_height='550px', overflow='auto'))
     running = {'value': False}
 
-    def refresh(_):
+    def scan(_=None):
         try:
-            base = Path(folder_text.value).expanduser().resolve(strict=True)
-            base.relative_to(DRIVE_ROOT.resolve())
+            base = inside_drive(folder_text.value)
             if not base.is_dir():
-                raise ValueError('Đường dẫn quét phải là thư mục.')
-            choices = list_videos(base)
-            selector.options = [(str(p.relative_to(DRIVE_ROOT)) + f' ({p.stat().st_size/1048576:.1f} MB)', str(p)) for p in choices] or [('Không thấy video', '')]
-            status.value = f'<small>Đã tìm thấy {len(choices)} video.</small>'
-        except Exception as exc:
-            status.value = f'<b style="color:red">Không thể quét thư mục: {str(exc)}</b>'
+                raise ValueError('Thư mục quét không tồn tại.')
+            found = list_videos(base)
+            selector.options = [(str(p.relative_to(DRIVE_ROOT)) + f' ({p.stat().st_size/1048576:.1f} MB)', str(p))
+                                for p in found] or [('Không thấy video, hãy nhập đường dẫn', '')]
+            status.value = f'<small>Đã tìm thấy {len(found)} video trên Drive.</small>'
+        except Exception as e:
+            status.value = f'<b style="color:red">Lỗi quét: {html.escape(str(e))}</b>'
+
+    def list_jobs(_):
+        with logs:
+            clear_output(wait=True)
+            rows = checkpoint_summary(checkpoints)
+            if not rows:
+                print('Chưa có checkpoint nào.')
+            for x in rows[:30]:
+                print(f"{x.get('updated_at','')} | {x.get('state','')} | "
+                      f"{x.get('completed_frames',0)} frame | "
+                      f"{x.get('source',{}).get('path','')} | job={x.get('job_id','')}")
 
     def start(_):
         if running['value']:
             return
         running['value'] = True
-        start_btn.disabled = True
-        reload_btn.disabled = True
+        for btn in (start_btn, scan_btn, jobs_btn):
+            btn.disabled = True
         with logs:
             clear_output(wait=True)
             try:
-                candidate = manual.value.strip() or selector.value
-                if not candidate:
-                    raise ValueError('Chưa chọn video. Hãy quét lại Drive hoặc nhập đường dẫn video.')
-                src = safe_drive_file(candidate)
-                target_folder = Path(output_text.value.strip()).resolve()
-                target_folder.relative_to(DRIVE_ROOT.resolve())
-                status.value = '<b>Đang khôi phục video bằng GPU...</b>'
-                final = restore_from_drive(src, target_folder, tile=int(tile.value))
-                status.value = f'<b style="color:green">Hoàn tất. MP4 nằm trong Drive: {final}</b>'
-                print('\nFile kết quả:', final)
-            except Exception as exc:
-                status.value = f'<b style="color:red">Lỗi: {str(exc)}</b>'
+                selected = manual.value.strip() or selector.value
+                if not selected:
+                    raise ValueError('Chưa chọn video nguồn.')
+                src = safe_drive_file(selected)
+                destination = inside_drive(output_text.value)
+                status.value = '<b>Đang chạy. Sau khi mất session, khởi động lại notebook và bấm Tiếp tục.</b>'
+                result = restore_from_drive(
+                    src, destination, tile=int(tile.value), segment_frames=int(chunk.value),
+                    crf=int(quality.value), precision=precision.value, stage_source=bool(stage.value))
+                status.value = '<b style="color:green">Hoàn thành! File MP4 đã lưu trên Google Drive.</b>'
+                print('Video đã lưu:', result)
+                display(FileLink(str(result), result_html_prefix='Mở/tải kết quả: '))
+            except Exception as e:
+                status.value = '<b style="color:red">Lỗi xử lý: ' + html.escape(str(e)) + '</b>'
                 traceback.print_exc()
+                print('Các segment đã checkpoint vẫn còn trên Drive; có thể tiếp tục lần sau.')
             finally:
                 running['value'] = False
-                start_btn.disabled = False
-                reload_btn.disabled = False
+                for btn in (start_btn, scan_btn, jobs_btn):
+                    btn.disabled = False
 
-    reload_btn.on_click(refresh)
+    scan_btn.on_click(scan)
+    jobs_btn.on_click(list_jobs)
     start_btn.on_click(start)
-    display(widgets.VBox([folder_text, widgets.HBox([reload_btn, status]), selector, manual, output_text, tile, start_btn, logs]))
-    if len(videos) == 1:
-        status.value = '<small>Tìm thấy 1 video. Nhấn Khôi phục để xử lý.</small>'
+    scan()
+    display(widgets.VBox([
+        folder_text, widgets.HBox([scan_btn, jobs_btn]), status,
+        selector, manual, output_text, checkpoint_text,
+        widgets.HBox([tile, precision]), widgets.HBox([quality, chunk]),
+        stage, start_btn, logs,
+    ]))
 
 
 if __name__ == '__main__':

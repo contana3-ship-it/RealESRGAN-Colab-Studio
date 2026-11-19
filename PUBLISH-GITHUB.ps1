@@ -111,8 +111,9 @@ try {
     Write-Host "Repo : https://github.com/$full"
     Write-Host "Colab: https://colab.research.google.com/github/$full/blob/main/colab/RealESRGAN_Studio.ipynb"
     Write-Host ""
-    Write-Host "Chay trong mot o Colab:"
-    Write-Host "!git clone $url /content/realesrgan-colab-studio && bash /content/realesrgan-colab-studio/colab/start.sh"
+    Write-Host "Mo notebook Colab trong lien ket phia tren va Run All."
+    Write-Host "Notebook se mount Google Drive, chon video va tu phuc hoi x4."
+    Write-Host "Khong can Cloudflare Tunnel."
 }
 catch {
     Write-Host ""

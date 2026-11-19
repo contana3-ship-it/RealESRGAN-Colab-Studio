@@ -37,9 +37,20 @@ def video_info(path):
 
 
 def install_weights():
+    """Cache the official weights on Drive; stage a local copy for fast model load.
+
+    On subsequent Colab runtimes, this avoids downloading weights from GitHub again.
+    """
     weights = ROOT / 'weights' / 'RealESRGAN_x4plus.pth'
     weights.parent.mkdir(parents=True, exist_ok=True)
     if weights.exists() and weights.stat().st_size > 10_000_000:
+        return weights
+    drive_cache = Path('/content/drive/MyDrive/RealESRGAN-Studio/weights/RealESRGAN_x4plus.pth')
+    if drive_cache.exists() and drive_cache.stat().st_size > 10_000_000:
+        print('Đang sử dụng model đã lưu trên Drive...', flush=True)
+        temp = weights.with_suffix('.download')
+        shutil.copyfile(drive_cache, temp)
+        temp.replace(weights)
         return weights
     temp = weights.with_suffix('.download')
     print('Đang tải trọng số RealESRGAN_x4plus chính thức...', flush=True)
@@ -54,7 +65,16 @@ def install_weights():
                         break
                     fh.write(block)
                     bar.update(len(block))
+        if temp.stat().st_size < 10_000_000:
+            raise RuntimeError('Trọng số model tải về không đủ dung lượng.')
         temp.replace(weights)
+        if Path('/content/drive/MyDrive').is_dir():
+            drive_cache.parent.mkdir(parents=True, exist_ok=True)
+            pending = drive_cache.with_suffix('.uploading')
+            shutil.copyfile(weights, pending)
+            if pending.stat().st_size != weights.stat().st_size:
+                raise IOError('Không thể lưu model lên Drive.')
+            pending.replace(drive_cache)
     except Exception:
         temp.unlink(missing_ok=True)
         raise
@@ -62,72 +82,21 @@ def install_weights():
 
 
 def run_restore(src: Path, tile=128, quality=95, clean_frames=True):
-    import cv2
-    from tqdm.auto import tqdm
-    import torch
-    fps, w, h, total = video_info(src)
-    if w * 4 > 8192 or h * 4 > 8192:
-        raise RuntimeError('Video đầu vào quá lớn để phóng x4 (giới hạn 8192px mỗi chiều).')
-    token = re.sub(r'[^A-Za-z0-9_-]+', '_', src.stem)[:36] or 'video'
-    folder = ROOT / f'{token}_{src.stat().st_size}'
-    frames = folder / 'frames'
-    frames.mkdir(parents=True, exist_ok=True)
-    output = folder / f'{token}_RealESRGAN_x4.mp4'
-    if output.exists() and output.stat().st_size > 0:
-        print('Đã có file hoàn chỉnh trong thư mục kết quả:', output)
-        return output
-    print(f'Video: {w}×{h}, {fps:.3f} FPS, số frame: {total or "đang xác định"}', flush=True)
-    weights = install_weights()
-    model = Upscaler(weights, tile=tile)
-    print(f'GPU: {torch.cuda.get_device_name(0)} | Model: RealESRGAN_x4plus | Tile: {tile}', flush=True)
-    cap = cv2.VideoCapture(str(src))
-    if not cap.isOpened():
-        raise RuntimeError('OpenCV không thể đọc video đầu vào.')
-    if not total:
-        counted = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        total = counted if counted > 0 else None
-    bar = tqdm(total=total, desc='Khôi phục khung hình', unit='frame', dynamic_ncols=True)
-    index = 0
-    completed_this_run = 0
-    started = time.monotonic()
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            destination = frames / f'{index:08d}.jpg'
-            if not destination.exists() or destination.stat().st_size == 0:
-                restored = model.enhance(frame)
-                if not cv2.imwrite(str(destination), restored, [cv2.IMWRITE_JPEG_QUALITY, quality]):
-                    raise RuntimeError(f'Không lưu được frame {index}.')
-                completed_this_run += 1
-            index += 1
-            bar.update(1)
-            if index % 10 == 0:
-                rate = completed_this_run / max(time.monotonic() - started, .01)
-                bar.set_postfix({'GPU fps': f'{rate:.2f}', 'xử lý mới': completed_this_run})
-    finally:
-        bar.close()
-        cap.release()
-    if index == 0:
-        raise RuntimeError('Video không có khung hình.')
-    print('Đã xử lý hình ảnh. Đang ghép video và âm thanh gốc...', flush=True)
-    temp = folder / 'restored.partial.mp4'
-    cmd = [
-        'ffmpeg', '-hide_banner', '-y', '-loglevel', 'error', '-stats',
-        '-framerate', f'{fps:.9f}', '-i', str(frames / '%08d.jpg'),
-        '-i', str(src), '-map', '0:v:0', '-map', '1:a:0?',
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac', '-b:a', '192k', '-shortest', '-movflags', '+faststart', str(temp),
-    ]
-    p = subprocess.run(cmd, text=True, capture_output=True)
-    if p.returncode:
-        raise RuntimeError('FFmpeg ghép video thất bại: ' + p.stderr[-2000:])
-    temp.replace(output)
-    if clean_frames:
-        shutil.rmtree(frames, ignore_errors=True)
-    print(f'✓ HOÀN THÀNH — {output} ({output.stat().st_size / 1048576:.1f} MB)', flush=True)
-    return output
+    """Legacy notebook entry point, now using resumable encoded segments.
+
+    For persistence across Colab runtimes, mount Google Drive first. The Drive
+    workflow in drive_app.py is the recommended interface.
+    """
+    from colab.checkpoint_engine import restore_video
+    persistent = Path('/content/drive/MyDrive/RealESRGAN-Studio/checkpoints')
+    checkpoint_root = persistent if Path('/content/drive/MyDrive').is_dir() else ROOT / 'checkpoints'
+    if not persistent.parent.is_dir():
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+    output = ROOT / 'outputs'
+    # Legacy JPEG quality=95 maps to high-quality H.264 CRF 14.
+    return restore_video(Path(src), output, checkpoint_root,
+                         tile=int(tile), crf=14 if quality >= 95 else 16,
+                         segment_frames=60, precision='fp16', stage_source=False)
 
 
 def main():
