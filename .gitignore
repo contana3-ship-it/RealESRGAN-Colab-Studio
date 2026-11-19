@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pth
+.env
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.jpg
+*.png
+*.partial.mp4
+data/
+.ipynb_checkpoints/
